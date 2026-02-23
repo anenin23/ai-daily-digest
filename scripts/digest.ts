@@ -6,11 +6,12 @@ import process from 'node:process';
 // Constants
 // ============================================================================
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+const LLM_BASE_URL = process.env.LLM_BASE_URL || 'http://127.0.0.1:8318/v1';
+const LLM_MODEL = process.env.LLM_MODEL || 'deepseek-chat';
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 const FEED_CONCURRENCY = 10;
-const GEMINI_BATCH_SIZE = 10;
-const MAX_CONCURRENT_GEMINI = 2;
+const LLM_BATCH_SIZE = 10;
+const MAX_CONCURRENT_LLM = 2;
 
 // 90 RSS feeds from Hacker News Popularity Contest 2025 (curated by Karpathy)
 const RSS_FEEDS: Array<{ name: string; xmlUrl: string; htmlUrl: string }> = [
@@ -146,7 +147,7 @@ interface ScoredArticle extends Article {
   reason: string;
 }
 
-interface GeminiScoringResult {
+interface LLMScoringResult {
   results: Array<{
     index: number;
     relevance: number;
@@ -157,7 +158,7 @@ interface GeminiScoringResult {
   }>;
 }
 
-interface GeminiSummaryResult {
+interface LLMSummaryResult {
   results: Array<{
     index: number;
     titleZh: string;
@@ -357,35 +358,36 @@ async function fetchAllFeeds(feeds: typeof RSS_FEEDS): Promise<Article[]> {
 }
 
 // ============================================================================
-// Gemini API
+// LLM API (OpenAI-compatible, via CLIProxy)
 // ============================================================================
 
-async function callGemini(prompt: string, apiKey: string): Promise<string> {
-  const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+async function callLLM(prompt: string, apiKey: string): Promise<string> {
+  const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        topP: 0.8,
-        topK: 40,
-      },
+      model: LLM_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      top_p: 0.8,
     }),
   });
-  
+
   if (!response.ok) {
     const errorText = await response.text().catch(() => 'Unknown error');
-    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
+    throw new Error(`LLM API error (${response.status}): ${errorText}`);
   }
-  
+
   const data = await response.json() as {
-    candidates?: Array<{
-      content?: { parts?: Array<{ text?: string }> };
+    choices?: Array<{
+      message?: { content?: string };
     }>;
   };
-  
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+  return data.choices?.[0]?.message?.content || '';
 }
 
 function parseJsonResponse<T>(text: string): T {
@@ -474,21 +476,21 @@ async function scoreArticlesWithAI(
   }));
   
   const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+  for (let i = 0; i < indexed.length; i += LLM_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + LLM_BATCH_SIZE));
   }
   
   console.log(`[digest] AI scoring: ${articles.length} articles in ${batches.length} batches`);
   
   const validCategories = new Set<string>(['ai-ml', 'security', 'engineering', 'tools', 'opinion', 'other']);
   
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_GEMINI) {
-    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_GEMINI);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_LLM) {
+    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_LLM);
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildScoringPrompt(batch);
-        const responseText = await callGemini(prompt, apiKey);
-        const parsed = parseJsonResponse<GeminiScoringResult>(responseText);
+        const responseText = await callLLM(prompt, apiKey);
+        const parsed = parseJsonResponse<LLMScoringResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
           for (const result of parsed.results) {
@@ -512,7 +514,7 @@ async function scoreArticlesWithAI(
     });
     
     await Promise.all(promises);
-    console.log(`[digest] Scoring progress: ${Math.min(i + MAX_CONCURRENT_GEMINI, batches.length)}/${batches.length} batches`);
+    console.log(`[digest] Scoring progress: ${Math.min(i + MAX_CONCURRENT_LLM, batches.length)}/${batches.length} batches`);
   }
   
   return allScores;
@@ -585,19 +587,19 @@ async function summarizeArticles(
   }));
   
   const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+  for (let i = 0; i < indexed.length; i += LLM_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + LLM_BATCH_SIZE));
   }
   
   console.log(`[digest] Generating summaries for ${articles.length} articles in ${batches.length} batches`);
   
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_GEMINI) {
-    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_GEMINI);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_LLM) {
+    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_LLM);
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildSummaryPrompt(batch, lang);
-        const responseText = await callGemini(prompt, apiKey);
-        const parsed = parseJsonResponse<GeminiSummaryResult>(responseText);
+        const responseText = await callLLM(prompt, apiKey);
+        const parsed = parseJsonResponse<LLMSummaryResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
           for (const result of parsed.results) {
@@ -617,7 +619,7 @@ async function summarizeArticles(
     });
     
     await Promise.all(promises);
-    console.log(`[digest] Summary progress: ${Math.min(i + MAX_CONCURRENT_GEMINI, batches.length)}/${batches.length} batches`);
+    console.log(`[digest] Summary progress: ${Math.min(i + MAX_CONCURRENT_LLM, batches.length)}/${batches.length} batches`);
   }
   
   return summaries;
@@ -651,7 +653,7 @@ ${articleList}
 直接返回纯文本总结，不要 JSON，不要 markdown 格式。`;
 
   try {
-    const text = await callGemini(prompt, apiKey);
+    const text = await callLLM(prompt, apiKey);
     return text.trim();
   } catch (error) {
     console.warn(`[digest] Highlights generation failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -908,7 +910,9 @@ Options:
   --help          Show this help
 
 Environment:
-  GEMINI_API_KEY  Required. Get one at https://aistudio.google.com/apikey
+  LLM_API_KEY     Optional. Defaults to CLIProxy key.
+  LLM_BASE_URL    Optional. Defaults to http://127.0.0.1:8318/v1
+  LLM_MODEL       Optional. Defaults to deepseek-chat
 
 Examples:
   bun scripts/digest.ts --hours 24 --top-n 10 --lang zh
@@ -939,12 +943,8 @@ async function main(): Promise<void> {
     }
   }
   
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.error('[digest] Error: GEMINI_API_KEY environment variable is required.');
-    console.error('[digest] Get one at: https://aistudio.google.com/apikey');
-    process.exit(1);
-  }
+  const apiKey = process.env.LLM_API_KEY || process.env.CLIPROXY_API_KEY || 'sk-2ffbeb6a4af6f3adb3176fe219b05052-202602';
+
   
   if (!outputPath) {
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
